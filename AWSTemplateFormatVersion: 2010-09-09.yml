@@ -1,0 +1,233 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Senior Cloud Engineer Circu Li-on case study
+
+Resources: 
+  # Define Customer Gateway (CGW)
+  MyCustomerGateway:
+    Type: AWS::EC2::CustomerGateway
+    Properties:
+      BgpAsn: 65000
+      IpAddress: 0.0.0.0  # Replace with your on-prem public IP
+      Type: ipsec.1
+      # Indicates the gateway supports IPsec (Internet Protocol Security), 
+      # which is the standard for encrypted VPN connections in AWS.
+      Tags:
+        - Key: Name
+          Value: MyCustomerGateway
+
+  # Create VPC
+  MyVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: MyVPC
+  
+  # Create Virtual Private Gateway
+  vgwName:
+    Type: AWS::EC2::VPNGateway
+    Properties:
+      Type: ipsec.1
+      Tags:
+        - Key: Name
+          Value: VpnGateway
+  # Attached Gateway to VPC
+  AttachVpnGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref MyVPC
+      VpnGatewayId: !Ref vgwName
+
+  # Create VPN Connection
+  MyVPNConnection:
+    Type: AWS::EC2::VPNConnection
+    Properties:
+      Type: ipsec.1
+      CustomerGatewayId: !Ref MyCustomerGateway
+      VpnGatewayId: !Ref vgwName
+      StaticRoutesOnly: true  # Change to false if using BGP
+      Tags:
+        - Key: Name
+          Value: MyVPNConnection
+
+   # Add a Static Route for the VPN
+  VPNRoute:
+    Type: AWS::EC2::VPNConnectionRoute
+    Properties:
+      DestinationCidrBlock: 192.0.0.0/24  # On-prem network CIDR
+      VpnConnectionId: !Ref MyVPNConnection
+
+  # Create S3 Storage Bucket
+  s3Bucket:
+    Type: AWS::S3::Bucket
+    Properties: 
+      BucketName: RecipeBucket-123 # This has to be unique
+      VersioningConfiguration:
+        Status: Enabled # Enable versioning
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref StorageEncryptionKey
+      NotificationConfiguration:
+        # Trigger notification to execute lambda function
+        LambdaConfiguration:
+          - Event: 's3:ObjectCreated:*'
+            Function: !GetAtt lambdaFunction.Arn
+
+  # AWS KMS key for data at rest encryption
+  StorageEncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Encryption key for storage at rest
+      KeyPolicy:
+        Version: '2012-10-17'
+        Id: key-default-1
+        Statement:
+          - Sid: Allow administration of the key
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action:
+              - kms:*
+            Resource: '*'
+
+  # Lambda Function
+  lambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: lambdaFunction
+      Handler: index.handler
+      Role: !GetAtt LambdaIamRole.Arn
+      Runtime: nodejs14.x
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const s3 = new AWS.S3();
+          const zlib = require('zlib');
+          const fs = require('fs');
+
+          exports.handler = async (event) => {
+            const bucket = event.Records[0].s3.bucket.name;
+            const key = event.Records[0].s3.object.key;
+
+            // Download the file from S3
+            const file = await s3.getObject({ Bucket: bucket, Key: key }).promise();
+
+            // Zip the file
+            const zipped = zlib.gzipSync(file.Body);
+
+            // Upload the zipped file back to S3
+            await s3.putObject({
+              Bucket: bucket,
+              Key: `zipped/${key}`,
+              Body: zipped
+            }).promise();
+
+            return {
+              statusCode: 200,
+              body: 'File zipped and uploaded successfully'
+            };
+          };
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref s3Bucket
+  
+  # IAM role to execute lambda function
+  LambdaIamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path:
+      AssumeRolePolicyDocument: 
+      Policies:
+        - 
+          - PolicyName: LambdaS3AccessPolicy
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - "logs:*" # allow CloudWatch Logs action
+                    - "s3:GetObject"   # Allow Lambda to read from S3
+                    - "s3:PutObject"   # Allow Lambda to write to S3
+                  Resource:
+                    - !GetAtt s3Bucket.Arn
+                    - !Sub "${s3Bucket.Arn}/*"
+
+  # permission for s3 to trigger lambda function
+  lambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !GetAtt lambdaFunction.Arn
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt s3Bucket.Arn
+
+  # Distribute zip-zrchive to global user
+  cloudfrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Origins:
+          - 
+            DomainName: !GetAtt s3Bucket.DomainName
+            Id: S3Origin
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          # First step of enabling TLS encryption for data in transit
+          ViewerProtocolPolicy: redirect-to-https  # Enforces HTTPS
+          AllowedMethods:
+            - GET
+            - HEAD
+          CachedMethods:
+            - GET
+            - HEAD
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none
+        # Second step of enabling TLS encryption
+        ViewerCertificate:
+          AcmCertificateArn: !Ref SSLCertificateArn  # Use AWS Certificate Manager (ACM) to create certificate and replace it here
+          SslSupportMethod: "sni-only" 
+          # Use Server Name Indication (SNI) for SSL/TLS
+          # This setting ensures that CloudFront uses SNI-based SSL for serving content securely,
+          # which is widely supported by most browsers and devices.
+
+Outputs:
+  VPCId:
+    Description: The ID of the VPC
+    Value: !Ref MyVPC
+
+  VPNGatewayId:
+    Description: The ID of the Virtual Private Gateway
+    Value: !Ref vgwName
+
+  VPNConnectionId:
+    Description: The ID of the VPN Connection
+    Value: !Ref MyVPNConnection
+  
+  BucketName:
+    Description: The name of the s3 bucket
+    Value: !Ref s3Bucket
+  
+  # Amazon Resource Name (ARN) - Helps other stacks to reference this bucket when needed
+  BucketArn:
+    Description: The ARN of the S3 bucket
+    Value: !GetAtt s3Bucket.Arn
+
+  LambdaFunctionName:
+    Description: "Name of the Lambda function"
+    Value: !Ref lambdaFunction
+
+  CloudFrontDistributionId:
+    Value: !Ref cloudfrontDistribution
+    Description: "CloudFront distribution ID for global delivery"
+
+  CloudFrontURL:
+    Value: !Sub "https://${cloudfrontDistribution.DomainName}"
+    Description: "URL of CloudFront distribution for accessing files"
